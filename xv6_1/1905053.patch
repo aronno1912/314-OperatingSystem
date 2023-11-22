@@ -1,0 +1,798 @@
+new file mode 100644
+index 0000000..c2098a2
+--- /dev/null
++{
++  "configurations": [
++    {
++      "name": "linux-gcc-x64",
++      "includePath": [
++        "${workspaceFolder}/**"
++      ],
++      "compilerPath": "/usr/bin/gcc",
++      "cStandard": "${default}",
++      "cppStandard": "${default}",
++      "intelliSenseMode": "linux-gcc-x64",
++      "compilerArgs": [
++        ""
++      ]
++    }
++  ],
++  "version": 4
++}
+\ No newline at end of file
+new file mode 100644
+index 0000000..98ab243
+--- /dev/null
++{
++  "version": "0.2.0",
++  "configurations": [
++    {
++      "name": "C/C++ Runner: Debug Session",
++      "type": "cppdbg",
++      "request": "launch",
++      "args": [],
++      "stopAtEntry": false,
++      "externalConsole": false,
++      "cwd": "/home/aronno/Documents/xv6-riscv",
++      "program": "/home/aronno/Documents/xv6-riscv/build/Debug/outDebug",
++      "MIMode": "gdb",
++      "miDebuggerPath": "gdb",
++      "setupCommands": [
++        {
++          "description": "Enable pretty-printing for gdb",
++          "text": "-enable-pretty-printing",
++          "ignoreFailures": true
++        }
++      ]
++    }
++  ]
++}
+\ No newline at end of file
+new file mode 100644
+index 0000000..4dd824d
+--- /dev/null
++{
++  "C_Cpp_Runner.cCompilerPath": "gcc",
++  "C_Cpp_Runner.cppCompilerPath": "g++",
++  "C_Cpp_Runner.debuggerPath": "gdb",
++  "C_Cpp_Runner.cStandard": "",
++  "C_Cpp_Runner.cppStandard": "",
++  "C_Cpp_Runner.msvcBatchPath": "",
++  "C_Cpp_Runner.useMsvc": false,
++  "C_Cpp_Runner.warnings": [
++    "-Wall",
++    "-Wextra",
++    "-Wpedantic",
++    "-Wshadow",
++    "-Wformat=2",
++    "-Wcast-align",
++    "-Wconversion",
++    "-Wsign-conversion",
++    "-Wnull-dereference"
++  ],
++  "C_Cpp_Runner.msvcWarnings": [
++    "/W4",
++    "/permissive-",
++    "/w14242",
++    "/w14287",
++    "/w14296",
++    "/w14311",
++    "/w14826",
++    "/w44062",
++    "/w44242",
++    "/w14905",
++    "/w14906",
++    "/w14263",
++    "/w44265",
++    "/w14928"
++  ],
++  "C_Cpp_Runner.enableWarnings": true,
++  "C_Cpp_Runner.warningsAsError": false,
++  "C_Cpp_Runner.compilerArgs": [],
++  "C_Cpp_Runner.linkerArgs": [],
++  "C_Cpp_Runner.includePaths": [],
++  "C_Cpp_Runner.includeSearch": [
++    "*",
++    "**/*"
++  ],
++  "C_Cpp_Runner.excludeSearch": [
++    "**/build",
++    "**/build/**",
++    "**/.*",
++    "**/.*/**",
++    "**/.vscode",
++    "**/.vscode/**"
++  ],
++  "C_Cpp_Runner.useAddressSanitizer": false,
++  "C_Cpp_Runner.useUndefinedSanitizer": false,
++  "C_Cpp_Runner.useLeakSanitizer": false,
++  "C_Cpp_Runner.showCompilationTime": false,
++  "C_Cpp_Runner.useLinkTimeOptimization": false
++}
+\ No newline at end of file
+diff --git a/Makefile b/Makefile
+index 39a99d7..50350ce 100644
+--- a/Makefile
++++ b/Makefile
+@@ -132,6 +132,10 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_trace\
++	$U/_history\
++	$U/_exit\
++
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..359f926 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -9,6 +9,9 @@ struct sleeplock;
+ struct stat;
+ struct superblock;
+ 
++//start.c
++void forceExit(void);
++
+ // bio.c
+ void            binit(void);
+ struct buf*     bread(uint, uint);
+@@ -106,6 +109,10 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++//new============================================================================================
++// edited
++int             trace(int);
++
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+diff --git a/kernel/io.c b/kernel/io.c
+new file mode 100644
+index 0000000..658528d
+--- /dev/null
++++ b/kernel/io.c
+@@ -0,0 +1,6 @@
++#include "types.h"
++#include "io.h"
++
++void outw(uint16_t port, uint16_t data) {
++  asm volatile("outw %0, %1" : : "a"(data), "Nd"(port));
++}
+\ No newline at end of file
+diff --git a/kernel/io.h b/kernel/io.h
+new file mode 100644
+index 0000000..fad557b
+--- /dev/null
++++ b/kernel/io.h
+@@ -0,0 +1,7 @@
++#ifndef _KERNEL_IO_H_
++#define _KERNEL_IO_H_
++#include <stdint.h>
++
++void outw(uint16_t port, uint16_t data);
++
++#endif // _KERNEL_IO_H_
+\ No newline at end of file
+diff --git a/kernel/kernelvec.S b/kernel/kernelvec.S
+index fb31b32..f909522 100644
+--- a/kernel/kernelvec.S
++++ b/kernel/kernelvec.S
+@@ -103,6 +103,9 @@ timervec:
+         sd a2, 8(a0)
+         sd a3, 16(a0)
+ 
++        ld a1,40(a0)
++        bne a1 ,zero,stop
++
+         # schedule the next timer interrupt
+         # by adding interval to mtimecmp.
+         ld a1, 24(a0) # CLINT_MTIMECMP(hart)
+@@ -122,3 +125,9 @@ timervec:
+         csrrw a0, mscratch, a0
+ 
+         mret
++
++        stop:
++        lui a1,0x100
++        lui a2,0x5
++        addi a2,a2,0x555
++        sw a2,0(a1)
+\ No newline at end of file
+diff --git a/kernel/param.h b/kernel/param.h
+index 6624bff..254c2a2 100644
+--- a/kernel/param.h
++++ b/kernel/param.h
+@@ -11,3 +11,4 @@
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+ #define FSSIZE       2000  // size of file system in blocks
+ #define MAXPATH      128   // maximum file path name
++#define TOTAL_SYS_CALL 23
+\ No newline at end of file
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 959b778..5335a91 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -124,6 +124,8 @@ allocproc(void)
+ found:
+   p->pid = allocpid();
+   p->state = USED;
++  //initialize
++  p->trace_id = 0;
+ 
+   // Allocate a trapframe page.
+   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+@@ -681,3 +683,13 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++// Trace a system call in the current ongoing process
++// Sets the system call id in the trace_id field of the current proc
++int
++trace(int which_one)
++{
++  struct proc *p = myproc();
++  p->trace_id = which_one;
++  return 0;
++}
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..7420e93 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,4 +104,6 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  //new===========================================================================================
++  int trace_id;                //ID of syscall which to be traced
+ };
+diff --git a/kernel/start.c b/kernel/start.c
+index e16f18a..a20da09 100644
+--- a/kernel/start.c
++++ b/kernel/start.c
+@@ -11,7 +11,7 @@ void timerinit();
+ __attribute__ ((aligned (16))) char stack0[4096 * NCPU];
+ 
+ // a scratch area per CPU for machine-mode timer interrupts.
+-uint64 timer_scratch[NCPU][5];
++uint64 timer_scratch[NCPU][6];
+ 
+ // assembly code in kernelvec.S for machine-mode timer interrupt.
+ extern void timervec();
+@@ -76,6 +76,7 @@ timerinit()
+   uint64 *scratch = &timer_scratch[id][0];
+   scratch[3] = CLINT_MTIMECMP(id);
+   scratch[4] = interval;
++  scratch[5]=0;
+   w_mscratch((uint64)scratch);
+ 
+   // set the machine-mode trap handler.
+@@ -87,3 +88,8 @@ timerinit()
+   // enable machine-mode timer interrupts.
+   w_mie(r_mie() | MIE_MTIE);
+ }
++
++void forceExit()
++{
++  timer_scratch[0][5]=1;
++}
+\ No newline at end of file
+diff --git a/kernel/stat.h b/kernel/stat.h
+index 19543af..f899a0a 100644
+--- a/kernel/stat.h
++++ b/kernel/stat.h
+@@ -9,3 +9,10 @@ struct stat {
+   short nlink; // Number of links to file
+   uint64 size; // Size of file in bytes
+ };
++
++
++struct syscall_stat{
++char syscall_name[16];
++int count;
++int accum_time;
++};
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..07ad7a9 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -7,7 +7,12 @@
+ #include "syscall.h"
+ #include "defs.h"
+ 
+-// Fetch the uint64 at addr from the current process.
++int typeOfArgs[6]={0,0,0,0,0,0};
++int intType[6];
++uint64* addressType[6];
++char* stringType[6];
++int flag; //to keep track if it is for trace of not
++//Fetch the uint64 at addr from the current process.
+ int
+ fetchaddr(uint64 addr, uint64 *ip)
+ {
+@@ -18,7 +23,6 @@ fetchaddr(uint64 addr, uint64 *ip)
+     return -1;
+   return 0;
+ }
+-
+ // Fetch the nul-terminated string at addr from the current process.
+ // Returns length of string, not including nul, or -1 for error.
+ int
+@@ -26,7 +30,9 @@ fetchstr(uint64 addr, char *buf, int max)
+ {
+   struct proc *p = myproc();
+   if(copyinstr(p->pagetable, buf, addr, max) < 0)
+-    return -1;
++    {
++      return -1;
++    }
+   return strlen(buf);
+ }
+ 
+@@ -57,6 +63,11 @@ void
+ argint(int n, int *ip)
+ {
+   *ip = argraw(n);
++  if(flag==1)
++  {
++  typeOfArgs[n]=1; //1 means integer type
++  intType[n]=*ip;
++  }
+ }
+ 
+ // Retrieve an argument as a pointer.
+@@ -66,6 +77,11 @@ void
+ argaddr(int n, uint64 *ip)
+ {
+   *ip = argraw(n);
++  if(flag==1)
++  {
++  typeOfArgs[n]=2; //2 means address type
++  addressType[n]=ip;
++  }
+ }
+ 
+ // Fetch the nth word-sized system call argument as a null-terminated string.
+@@ -75,7 +91,16 @@ int
+ argstr(int n, char *buf, int max)
+ {
+   uint64 addr;
++  int temp;
++  temp=flag;
++  flag=0; //force to 0,so that it doesn't print the address arg here
+   argaddr(n, &addr);
++  flag=temp;
++  if(flag==1)
++  {
++  typeOfArgs[n]=3; //1 means string type
++  stringType[n]=buf;
++  }
+   return fetchstr(addr, buf, max);
+ }
+ 
+@@ -102,6 +127,12 @@ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+ 
++
++// user defined sys calls
++extern uint64 sys_trace(void);
++extern uint64 sys_history(void);
++extern uint64 sys_shutdown(void);
++
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+ static uint64 (*syscalls[])(void) = {
+@@ -126,22 +157,125 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_trace]  sys_trace,
++[SYS_history]  sys_history,
++[SYS_shutdown]  sys_shutdown,
++};
++
++int syscall_counter[NELEM(syscalls)] = {0};
++int syscall_time[NELEM(syscalls)] = {0};
++
++static char* syscall_names[] = {
++[SYS_fork]    "fork",
++[SYS_exit]    "exit",
++[SYS_wait]    "wait",
++[SYS_pipe]    "pipe",
++[SYS_read]    "read",
++[SYS_kill]    "kill",
++[SYS_exec]    "exec",
++[SYS_fstat]   "fstat",
++[SYS_chdir]   "chdir",
++[SYS_dup]     "dup",
++[SYS_getpid]  "getpid",
++[SYS_sbrk]    "sbrk",
++[SYS_sleep]   "sleep",
++[SYS_uptime]  "uptime",
++[SYS_open]    "open",
++[SYS_write]   "write",
++[SYS_mknod]   "mknod",
++[SYS_unlink]  "unlink",
++[SYS_link]    "link",
++[SYS_mkdir]   "mkdir",
++[SYS_close]   "close",
++[SYS_trace]   "trace",
++[SYS_history]   "history",
++[SYS_shutdown]   "shutdown",
++
+ };
+ 
++int get_syscall_counter(int i) {
++    return syscall_counter[i];
++}
++
++int get_syscall_time(int i) {
++    return syscall_time[i];
++}
++
++
++const char* get_syscall_name(int index) {
++    return syscall_names[index];
++
++}
++int get_total_syscall()
++{
++  return NELEM(syscalls);
++}
++
+ void
+ syscall(void)
+ {
+   int num;
+   struct proc *p = myproc();
+-
+-  num = p->trapframe->a7;
+-  if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+-    // Use num to lookup the system call function for num, call it,
++  // Use num to lookup the system call function for num, call it,
+     // and store its return value in p->trapframe->a0
+-    p->trapframe->a0 = syscalls[num]();
+-  } else {
+-    printf("%d %s: unknown sys call %d\n",
+-            p->pid, p->name, num);
+-    p->trapframe->a0 = -1;
++    //p->trapframe->a0 = syscalls[num]();
++  num = p->trapframe->a7;
++  for(int i=0;i<6;i++)
++  {
++    typeOfArgs[i]=0;
+   }
++if(num > 0 && num < NELEM(syscalls) && syscalls[num]){
++acquire(&tickslock);
++int temp =p->trace_id; //tracing syscall
++int p_id=p->pid;
++release(&tickslock);
++ if (temp == num)
++{
++  flag=1;
++}
++else
++{
++  flag=0;
++}
++int t1=ticks;
++p->trapframe->a0 = syscalls[num]();
++int t2=ticks;
++acquire(&tickslock);
++syscall_counter[num]++;
++syscall_time[num] += (t2 - t1);
++release(&tickslock);
++if (temp == num)
++{
++  printf("\npid: %d, syscall: %s, args: (", p_id, syscall_names[temp]);
++  for(int i=0;i<6;i++)
++  {
++    int whichType=typeOfArgs[i];
++    switch(whichType)
++    {
++      case 1:
++      {
++        if(i>0)
++        {printf(",");}
++        printf("%d",intType[i]);
++        break;
++      }
++       case 2:
++      {
++        if(i>0)
++        {printf(",");}
++        printf("%p",addressType[i]);
++        break;
++      }
++       case 3:
++      {
++        if(i>0)
++        {printf(",");}
++        printf("%s",stringType[i]);
++        break;
++      }
++    }
++  }
++   printf("), return : %d\n", p->trapframe->a0);
++}
++}
+ }
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..b2eba2a 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,8 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++
++// new=============================================
++#define SYS_trace  22
++#define SYS_history  23
++#define SYS_shutdown  24
+diff --git a/kernel/syscall_names.h b/kernel/syscall_names.h
+new file mode 100644
+index 0000000..82fe5f0
+--- /dev/null
++++ b/kernel/syscall_names.h
+@@ -0,0 +1,6 @@
++#ifndef _KERNEL_SYSCALL_NAMES_H_
++#define _KERNEL_SYSCALL_NAMES_H_
++
++extern char* syscall_names[];
++
++#endif // _KERNEL_SYSCALL_NAMES_H_
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 1de184e..eb33628 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -5,7 +5,17 @@
+ #include "memlayout.h"
+ #include "spinlock.h"
+ #include "proc.h"
++#include "stat.h"
++#include "io.h"
++//#define TOTAL_SYS_CALL 23
+ 
++//#define MAX_LENGTH 16
++
++int globalExitflag=0;
++extern int get_syscall_counter(int i);
++extern int get_syscall_time(int i);
++extern const char* get_syscall_name(int index) ;
++extern int get_total_syscall();
+ uint64
+ sys_exit(void)
+ {
+@@ -89,3 +99,58 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++//new==================================================================================
++// trace system call during current process
++uint64
++sys_trace(void)
++{
++  int which_one;
++  argint(0, &which_one);
++  return trace(which_one);
++}
++
++
++uint64
++sys_history(void)
++{
++
++
++ struct syscall_stat sp;
++  int sid;
++  uint64 address;
++  argint(0,&sid);
++  argaddr(1,&address);
++  int total=get_total_syscall();
++  if(sid<1 || sid >total)
++  {
++    return -1;
++  }
++  //printf("kernel side e addrs %d",address);
++int sz=sizeof(get_syscall_name(sid));
++strncpy(sp.syscall_name, get_syscall_name(sid), sz-1);
++  sp.syscall_name[sz-1] = '\0';
++  sp.count=get_syscall_counter(sid);
++  sp.accum_time= get_syscall_time(sid);
++  // printf("%s  \n",sp.syscall_name);
++  //  printf("%d  \n",sp.count);
++  //    printf("%d  \n",sp.accum_time);
++
++  struct proc *p=myproc();
++  //  // Copy the struct to user space
++  if(copyout(p->pagetable,address,(char*)&sp,sizeof(sp))<0)
++  {
++    //printf("vulllllllllllllllllllllllllllllllllll");
++  return -1;
++  }
++
++  return 0;
++
++}
++uint64
++sys_shutdown(void)
++{
++  forceExit();
++ //sys_exit();
++  return 0;
++}
+diff --git a/user/exit.c b/user/exit.c
+new file mode 100644
+index 0000000..a39f65e
+--- /dev/null
++++ b/user/exit.c
+@@ -0,0 +1,11 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++
++int main(int argc, char * argv[])
++{
++    printf("Exiting from the system\n");
++    shutdown();
++    exit(0);
++}
+\ No newline at end of file
+diff --git a/user/history.c b/user/history.c
+new file mode 100644
+index 0000000..39b0770
+--- /dev/null
++++ b/user/history.c
+@@ -0,0 +1,51 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++//#define MAX_LENGTH 16
++
++
++
++int
++main(int argc, char *argv[])
++{
++   if(argc  > 2){
++       printf("USAGE : history syscall_number");
++   }
++
++   if(argc==1)
++   {
++      struct syscall_stat sp;
++      for (int i=1; i<=TOTAL_SYS_CALL;i++)
++      {
++        history(i,&sp);
++         printf("%d :    syscall: %s, #: %d, time : %d\n",i,sp.syscall_name, sp.count, sp.accum_time);
++      }
++
++   }
++
++   if(argc == 2)
++   {
++      if(atoi(argv[1])<1 || atoi(argv[1])>TOTAL_SYS_CALL)
++      {
++         printf("no such system call number!!\n");
++         return 0;
++      }
++       struct syscall_stat sp;
++       //printf("user side e addrs %d",&sp);
++       int x=history(atoi(argv[1]),&sp);
++    //    char buf[MAX_LENGTH];
++    //      strncpy(buf,sp.syscall_name, MAX_LENGTH-1);
++    //      buf[MAX_LENGTH-1] = '\0';
++         if(x!=0)
++         {
++            printf("Invalid input");
++            return -1;
++         }
++
++        printf("%d :    syscall: %s, #: %d, time : %d\n",atoi(argv[1]),sp.syscall_name, sp.count, sp.accum_time);
++   }
++
++   return 0;
++}
+diff --git a/user/sh.c b/user/sh.c
+index 836ebcb..a72ca11 100644
+--- a/user/sh.c
++++ b/user/sh.c
+@@ -64,6 +64,9 @@ runcmd(struct cmd *cmd)
+   struct listcmd *lcmd;
+   struct pipecmd *pcmd;
+   struct redircmd *rcmd;
++// if (cmd->type == EXEC && strcmp(((struct execcmd*)cmd)->argv[0], "exit") == 0) {
++//   exit(1);
++// }
+ 
+   if(cmd == 0)
+     exit(1);
+@@ -158,6 +161,9 @@ main(void)
+ 
+   // Read and run input commands.
+   while(getcmd(buf, sizeof(buf)) >= 0){
++  //   if (strcmp(buf, "exit") == 0) {
++  //   exit(0);
++  // }
+     if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
+       // Chdir must be called by the parent, not the child.
+       buf[strlen(buf)-1] = 0;  // chop \n
+diff --git a/user/trace.c b/user/trace.c
+new file mode 100644
+index 0000000..3dd9b4c
+--- /dev/null
++++ b/user/trace.c
+@@ -0,0 +1,27 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int
++main(int argc, char *argv[])
++{
++  int i;
++  char *nargv[MAXARG];
++
++  if(argc < 3 || (argv[1][0] < '0' || argv[1][0] > '9')){
++    fprintf(2, "Usage: %s sys_call_num command\n", argv[0]);
++    exit(1);
++  }
++
++  if (trace(atoi(argv[1])) < 0) {
++    fprintf(2, "%s: trace failed\n", argv[0]);
++    exit(1);
++  }
++
++  for(i = 2; i < argc && i < MAXARG; i++){
++    nargv[i-2] = argv[i];
++  }
++  exec(nargv[0], nargv);
++  exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index 4d398d5..2f93e41 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,4 +1,5 @@
+ struct stat;
++struct syscall_stat;
+ 
+ // system calls
+ int fork(void);
+@@ -23,6 +24,12 @@ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
+ 
++// system calls (new)
++int trace(int);
++int history(int n, struct syscall_stat*);
++int shutdown(void);
++
++
+ // ulib.c
+ int stat(const char*, struct stat*);
+ char* strcpy(char*, const char*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..6b17a70 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,7 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++#new====================================
++entry("trace");
++entry("history");
++entry("shutdown");

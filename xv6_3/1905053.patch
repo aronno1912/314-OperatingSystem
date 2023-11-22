@@ -1,0 +1,1156 @@
+diff --git a/Makefile b/Makefile
+index 39a99d7..42f665a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -132,6 +132,8 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_threads\
++	$U/_pc\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..137a071 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -106,6 +106,12 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++void            thread_freepagetable(pagetable_t pagetable, uint64 sz);
++int             thread_create(uint64 func, uint64 arg, uint64 stack);
++int            thread_join(int pid);
++int             conditional_wait(uint64 addr, int checkingVal);
++void            conditional_wake(uint64 addr, int count);
++
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+@@ -173,6 +179,9 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++int             uvmmirror(pagetable_t, pagetable_t, uint64);
++int             uvmnewmirror(pagetable_t, pagetable_t, uint64,uint64);
++uint64          virtualToPhysical(pagetable_t pagetable, uint64 srcva);
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 959b778..c627772 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -9,10 +9,11 @@
+ struct cpu cpus[NCPU];
+ 
+ struct proc proc[NPROC];
+-
++struct spinlock memLockArray[NPROC];
+ struct proc *initproc;
+ 
+ int nextpid = 1;
++int nextmid=1;
+ struct spinlock pid_lock;
+ 
+ extern void forkret(void);
+@@ -56,6 +57,11 @@ procinit(void)
+       p->state = UNUSED;
+       p->kstack = KSTACK((int) (p - proc));
+   }
++
++  struct spinlock *m;
++  for(m = memLockArray; m < &memLockArray[NPROC]; m++){
++    initlock(m,"memlock");
++  }
+ }
+ 
+ // Must be called with interrupts disabled,
+@@ -102,6 +108,19 @@ allocpid()
+   return pid;
+ }
+ 
++int
++allocmem_id()
++{
++  int mid;
++
++  acquire(&pid_lock);
++  mid = nextmid;
++  nextpid = nextmid + 1;
++  release(&pid_lock);
++
++  return mid;
++}
++
+ // Look in the process table for an UNUSED proc.
+ // If found, initialize state required to run in the kernel,
+ // and return with p->lock held.
+@@ -123,6 +142,8 @@ allocproc(void)
+ 
+ found:
+   p->pid = allocpid();
++  p->mem_id=p->pid;  //later change in thread_create
++  p->is_thread=0;
+   p->state = USED;
+ 
+   // Allocate a trapframe page.
+@@ -159,7 +180,16 @@ freeproc(struct proc *p)
+     kfree((void*)p->trapframe);
+   p->trapframe = 0;
+   if(p->pagetable)
+-    proc_freepagetable(p->pagetable, p->sz);
++    {
++      if(p->is_thread)
++      {
++        thread_freepagetable(p->pagetable, p->sz);
++      }
++      else
++      {
++       proc_freepagetable(p->pagetable, p->sz);
++      }
++    }
+   p->pagetable = 0;
+   p->sz = 0;
+   p->pid = 0;
+@@ -256,21 +286,99 @@ userinit(void)
+ 
+ // Grow or shrink user memory by n bytes.
+ // Return 0 on success, -1 on failure.
++// int
++// growproc(int n)
++// {
++//   // uvmmalloc notun physical page allcate kore, demalloc hocche page ta k delete kore dey
++//   uint64 sz;
++//   struct proc *p = myproc();
++//    acquire(&memLockArray[p->mem_id]);
++//   sz = p->sz;
++//   if(n > 0){
++//     if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0)
++//      {
++//        release(&memLockArray[p->mem_id]);
++//       return -1;
++//     }
++//   } else if (n < 0) {
++//     // Adjust the starting point for uvmunmap() based on the new size
++//     sz = uvmdealloc(p->pagetable, PGROUNDUP(sz + n), sz);
++
++//     // Loop over processes with the same mem_id and update mappings if needed
++//     for (struct proc *tp = proc; tp < &proc[NPROC]; tp++) {
++//       if (tp != p && tp->mem_id == p->mem_id && tp->sz > sz) {
++//         uvmunmap(tp->pagetable, PGROUNDUP(sz), (tp->sz - sz) / PGSIZE, 0);  //do free te c0 dicchi ( tahole oi physical address ta chharbe na)
++//       }
++//     }
++//   }
++
++//   // Update sz for the current process
++//   p->sz = sz;
++
++//   release(&memLockArray[p->mem_id]);
++//   return 0;
++// }
++
++// int
++// growproc(int n)
++// {
++//   uint64 sz;
++//   struct proc *p = myproc();
++
++//   sz = p->sz;
++//   if(n > 0){
++//     if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
++//       return -1;
++//     }
++//   } else if(n < 0){
++//     sz = uvmdealloc(p->pagetable, sz, sz + n);
++//   }
++//   p->sz = sz;
++//   return 0;
++// }
+ int
+ growproc(int n)
+ {
+   uint64 sz;
++
+   struct proc *p = myproc();
++  struct proc *lp = myproc();
++
++  acquire(&memLockArray[p->mem_id]);
+ 
+   sz = p->sz;
+   if(n > 0){
+     if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
+       return -1;
+     }
+-  } else if(n < 0){
++  } else if(n < 0)
++  {
+     sz = uvmdealloc(p->pagetable, sz, sz + n);
+   }
+   p->sz = sz;
++  // the new part ==============================================
++  for(lp = proc; lp < &proc[NPROC]; lp++) {
++    if (lp != p && lp->mem_id == p->mem_id)
++     {
++        if(n>0)
++        {
++          //lp->sz=old size... p->sz= new size
++          uvmnewmirror(p->pagetable,lp->pagetable,lp->sz,p->sz);
++
++
++        }
++        else
++        {
++          ////lp->sz=old size... p->sz= new size
++          uvmunmap(lp->pagetable,PGROUNDUP(p->sz),(PGROUNDUP(lp->sz) - PGROUNDUP(p->sz)) / PGSIZE,1);
++
++        }
++        lp->sz=p->sz;
++
++      }
++  }
++
++  release(&memLockArray[p->mem_id]);
+   return 0;
+ }
+ 
+@@ -298,7 +406,7 @@ fork(void)
+ 
+   // copy saved user registers.
+   *(np->trapframe) = *(p->trapframe);
+-
++    //np->is_thread = 0;
+   // Cause fork to return 0 in the child.
+   np->trapframe->a0 = 0;
+ 
+@@ -311,6 +419,7 @@ fork(void)
+   safestrcpy(np->name, p->name, sizeof(p->name));
+ 
+   pid = np->pid;
++  np->mem_id = pid % NPROC; // jate mem_id 63 er beshi na hoye jay
+ 
+   release(&np->lock);
+ 
+@@ -681,3 +790,183 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++
++// helper that will need in freeproc.. just unmap koraye dibo..uvmfree kora lagbe na
++//******************** see proc_freepagetable function ***************************************
++void thread_freepagetable(pagetable_t pagetable, uint64 sz)
++{
++  uvmunmap(pagetable, TRAMPOLINE, 1, 0);
++  uvmunmap(pagetable, TRAPFRAME, 1, 0);
++}
++
++//almost same as fork...used uvmmirror instead of uvmcopy (a new process with the same address space as the calling process.)
++int
++thread_create(uint64 fcn, uint64 arg, uint64 stack)
++{
++
++  struct proc *np; //is a pointer to the new process
++  struct proc *parent = myproc(); //is a pointer to the calling process (the parent process creating the thread).
++  int i, pid;
++
++  // Allocate process.  allocates a new proc structure for the new thread.
++  // If allocproc() returns 0 (indicating no available process slots), the function returns -1 to indicate failure.
++  if((np = allocproc()) == 0)
++  {
++    return -1;
++  }
++
++  // Copy user memory from parent to child.
++  //uvmmirror is a function that copies the user memory (address space) from the parent process (parent) to the new thread's pagetable.
++  if(uvmmirror(parent->pagetable, np->pagetable, parent->sz) < 0)
++  {
++    freeproc(np);
++    release(&np->lock);
++    return -1;
++  }
++
++  np->sz = parent->sz;
++
++  // copy saved user registers. done to ensure that the new thread starts execution with the same state as the parent process.
++  *(np->trapframe) = *(parent->trapframe);
++
++  // return thread pid in caller.  the parent process's trapframe's a0 register (return value register) is set to the
++  //new thread's process ID. This is how the thread_create system call returns the newly created thread's process ID to the caller.
++  parent->trapframe->a0 = np->pid;
++
++
++//This loop increments reference counts on open file descriptors and duplicates them for the new thread.
++//It also duplicates the current working directory
++  for(i = 0; i < NOFILE; i++)
++    if(parent->ofile[i])
++      np->ofile[i] = filedup(parent->ofile[i]);
++  np->cwd = idup(parent->cwd);
++
++  safestrcpy(np->name, parent->name, sizeof(parent->name));
++
++  pid = np->pid;
++  //==============================this part is new from fork...the new thread's trapframe is set up:
++  np->is_thread = 1;
++  np->mem_id=parent->mem_id;  //cause new thread same process er under e, but new threads will have different pid(that is tid basically),which will be got from allocproc
++  np->trapframe->sp = stack + PGSIZE;  //sp (stack pointer) is set to the top of the user stack.
++  np->trapframe->a0 = arg;  //arg push kora
++  np->trapframe->epc = fcn;  //epc is set to the provided function's address.  sets the program counter to the start of that function,
++                                                                              //so when the process is started by the scheduler, it starts from that point.
++
++  //performs a memory copy from the parent process's address space to the user stack of the new thread
++  if(copyout(parent->pagetable, stack - sizeof(void *), (char *)&arg, sizeof(arg)) < 0)
++    return -1;
++
++  release(&np->lock);
++  acquire(&wait_lock);
++  np->parent = parent;
++  release(&wait_lock);
++  acquire(&np->lock);
++  np->state = RUNNABLE;
++  release(&np->lock);
++  return pid;
++}
++
++/***                wait         **********/
++/*** waits for a specific child thread to finish execution. It repeatedly scans the process table, checking the state of child threads.
++ * If a child thread has finished, it cleans up the resources, updates the PID, and returns to the calling thread. If there are no more
++ * child threads or the calling thread has been killed, it exits. Otherwise, the calling thread is put to sleep until
++ * one of its child threads finishes execution.**/
++int
++thread_join(int tid)
++{
++  // Almost same as wait
++
++  struct proc *pp;
++  int havekids;
++  struct proc *p = myproc();
++  acquire(&wait_lock);
++
++  for(;;)
++  {
++    // Scan through table looking for exited children.
++    havekids = 0;
++    for(pp = proc; pp < &proc[NPROC]; pp++)
++    {
++      if(pp->parent == p && pp->is_thread==1 && pp->pid==tid)
++      {
++        // make sure the child isn't still in exit() or swtch().
++        acquire(&pp->lock);
++
++        havekids = 1;
++        if(pp->state == ZOMBIE) //now need to clean up
++        {
++          // Found one.
++          // hereeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
++          freeproc(pp); //deallocates resources associated with the child thread, in free proc we checked is_thread seperately
++          release(&pp->lock);
++          release(&wait_lock);
++          return tid;
++          }
++          // hereeeeeeeeeeeeeeeeeeeeeeeeee
++          release(&pp->lock);
++        }
++
++      }
++      // No point waiting if we don't have any children.
++    if(!havekids || killed(p))
++    {
++      release(&wait_lock);
++      return -1;
++    }
++
++    // Wait for a child to exit.
++    sleep(p, &wait_lock);  //DOC: wait-sleep
++  }
++}
++
++
++// a va and the signal on which conditional variable works
++int conditional_wait(uint64 addr, int checkingVal)
++{
++  struct proc *p  = myproc();
++  acquire(&memLockArray[p->mem_id]);
++
++  //is used to convert the virtual address addr to its corresponding physical address within the process's page table.
++  //gets a pointer (phyAd) to the actual memory location being pointed to by addr
++  //phyAd is basically the address of the cv
++  int* phyAd = (int *) virtualToPhysical(p->pagetable, addr);
++
++  //built-in atomic compare-and-swap operation
++  // if value at phyAd=checkingVal returns true; just checking
++  if(__sync_bool_compare_and_swap(phyAd, checkingVal, checkingVal))
++  {
++    sleep(phyAd, &memLockArray[p->mem_id]); ////chanel e var er address ta diye disi
++    release(&memLockArray[p->mem_id]);
++    return 0;
++  }
++
++  release(&memLockArray[p->mem_id]);
++  return -1;
++}
++
++///==== a mechanism to wake up multiple threads that are potentially waiting on a shared memory condition.
++//how many to wakeup=n
++void conditional_wake(uint64 addr, int count)
++{
++  struct proc *p = myproc();
++  struct proc *pp;
++  acquire(&memLockArray[p->mem_id]);
++  int* phyAd = (int *)virtualToPhysical(p->pagetable, addr);
++  for(pp = proc; pp < &proc[NPROC] && count > 0; pp++)
++   {
++    //not me
++    if(pp != myproc())
++    {
++      acquire(&pp->lock);
++      //if the process pp is sleeping on the same address as the one specified by
++      if(pp->state == SLEEPING && pp->chan == phyAd && p->mem_id == pp->mem_id)
++      {
++        pp->state = RUNNABLE;
++        count--;
++      }
++      release(&pp->lock);
++    }
++  }
++  release(&memLockArray[p->mem_id]);
++}
+\ No newline at end of file
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..0b72a5b 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -81,6 +81,7 @@ struct trapframe {
+ 
+ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ 
++
+ // Per-process state
+ struct proc {
+   struct spinlock lock;
+@@ -104,4 +105,7 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  //struct spinlock memlock; // Memory access lock
++  int is_thread;           // Flag indicating if the process is a thread
++  int mem_id;
+ };
+diff --git a/kernel/spinlock.c b/kernel/spinlock.c
+index 9840302..d50c744 100644
+--- a/kernel/spinlock.c
++++ b/kernel/spinlock.c
+@@ -46,8 +46,9 @@ acquire(struct spinlock *lk)
+ void
+ release(struct spinlock *lk)
+ {
+-  if(!holding(lk))
++  if(!holding(lk)){
+     panic("release");
++  }
+ 
+   lk->cpu = 0;
+ 
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..c3768a1 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,11 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_thread_create(void);
++extern uint64 sys_thread_join(void);
++extern uint64 sys_thread_exit(void);
++extern uint64 sys_conditional_wait(void);
++extern uint64 sys_conditional_wake(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +131,11 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_thread_create] sys_thread_create,
++[SYS_thread_join] sys_thread_join,
++[SYS_thread_exit] sys_thread_exit,
++[SYS_conditional_wait]  sys_conditional_wait,
++[SYS_conditional_wake] sys_conditional_wake
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..dbefcff 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,9 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++// new syscalls
++#define SYS_thread_create 22
++#define SYS_thread_join 23
++#define SYS_thread_exit 24
++#define SYS_conditional_wait  25
++#define SYS_conditional_wake  26
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 1de184e..c4fa58e 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -89,3 +89,58 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_thread_create(void)
++{
++   // if (argptr(0, &fcn, sizeof(void*)) < 0 ||
++    //     argptr(1, &arg, sizeof(void*)) < 0 ||
++    //     argptr(2, &stack, sizeof(void*)) < 0)
++    //     return -1;
++  //   uint64 fcn;
++  // uint64 arg;
++  // uint64 stack;
++  uint64 fcn;
++  uint64 arg;
++  uint64 stack;
++  argaddr(0, &fcn);
++  argaddr(1, &arg);
++  argaddr(2, &stack);
++
++  return thread_create(fcn, arg, stack);
++}
++
++uint64
++sys_thread_join(void)
++{
++  int tid;
++  argint(0, &tid);
++  return thread_join(tid);
++
++}
++
++uint64
++sys_thread_exit(void){
++
++  exit(0);
++  return 0;
++}
++//==============================================Conditionals=================================================================
++uint64 sys_conditional_wait(void)
++{
++  uint64 addr; //address of the cond_var
++  int signal; //value of the signal
++  argaddr(0, &addr);
++  argint(1, &signal);
++  return conditional_wait(addr, signal);
++}
++
++uint64 sys_conditional_wake(void)
++{
++  uint64 addr;
++  int n; //num of threads to be awakened
++  argaddr(0, &addr);
++  argint(1, &n);
++  conditional_wake(addr, n);
++  return 0;
++}
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 9f69783..31a02ea 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -332,6 +332,68 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   return -1;
+ }
+ 
++//  mirrors the existing memory content by creating a new mapping without duplicating the content. basically uvmcopy with no kalloc and kfree
++// needs because threads share same address space
++
++int
++uvmmirror(pagetable_t old, pagetable_t new, uint64 sz)
++{
++  pte_t *pte;
++  uint64 pa, i;  // pa is physical address of page
++  uint flags;
++
++  for(i = 0; i < sz; i += PGSIZE){
++    if((pte = walk(old, i, 0)) == 0)
++      panic("uvmmirror: pte should exist");
++    if((*pte & PTE_V) == 0)
++      panic("uvmmirror: page not present");
++    pa = PTE2PA(*pte); //Extracts the physical address from the PTE.
++    flags = PTE_FLAGS(*pte);
++
++   //if the mapping of a page from the old process's memory to the new process's memory fails, unmaps all the pages that were successfully mapped before the error occurred and then returns an error code (-1)
++    if(mappages(new, i, PGSIZE, pa, flags) != 0){
++      goto err;
++    }
++  }
++  return 0;
++
++ err:
++  uvmunmap(new, 0, i / PGSIZE, 1);
++  return -1;
++}
++
++//from after oldsize to newsize do the mapping
++int
++uvmnewmirror(pagetable_t old, pagetable_t new, uint64 oldsz,uint64 newsz)
++{
++  pte_t *pte;
++  uint64 pa, i;  // pa is physical address of page
++  uint flags;
++
++  for(i = oldsz; i < newsz; i += PGSIZE){
++    if((pte = walk(old, i, 0)) == 0)
++      panic("uvmnewmirror: pte should exist");
++    if((*pte & PTE_V) == 0)
++      panic("uvmnewmirror: page not present");
++    pa = PTE2PA(*pte); //Extracts the physical address from the PTE.
++    flags = PTE_FLAGS(*pte);
++
++   //if the mapping of a page from the old process's memory to the new process's memory fails, unmaps all the pages that were successfully mapped before the error occurred and then returns an error code (-1)
++    if(mappages(new, i, PGSIZE, pa, flags) != 0){
++      goto err;
++    }
++  }
++  return 0;
++
++ err:
++  uvmunmap(new, 0, i / PGSIZE, 1);
++  return -1;
++}
++
++
++
++
++
+ // mark a PTE invalid for user access.
+ // used by exec for the user stack guard page.
+ void
+@@ -437,3 +499,15 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+     return -1;
+   }
+ }
++//=====================================for conditional vars===============================================================
++uint64 virtualToPhysical(pagetable_t pagetable, uint64 srcva)
++{
++  /**   Got idea from copyin function
++   * This rounds down the virtual address (srcva) to the nearest lower page boundary. This is done because physical memory is
++   *  managed in page-sized chunks, and this ensures that we are working with the base address of the page containing srcva.
++  */
++  uint64 vir0 = PGROUNDDOWN(srcva);
++  // to find the page table entry (PTE) for the page containing virtualaddress0 . This returns the physical address of the page table entry
++  uint64 pa0 = walkaddr(pagetable, vir0);
++  return pa0 + (srcva - vir0); //(srcva - vir0) calculates the offset within that page.
++}
+diff --git a/user/pc.c b/user/pc.c
+new file mode 100644
+index 0000000..8bc0b0d
+--- /dev/null
++++ b/user/pc.c
+@@ -0,0 +1,141 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "user/thread_cv.h"
++#include "user/threadLock.h"
++#include "user/thread_semaphore.h"
++struct queue{
++	int arr[16];
++	int front;
++	int rear;
++	int size;
++
++};
++
++void queue(struct queue *q)
++{
++    q->front = 0;
++    q->rear = 0;
++    q->size = 0;
++}
++void push(struct queue *q, int x)
++{
++    q->arr[q->rear] = x;
++    q->rear = (q->rear+1)%16;
++    q->size++;
++}
++int front(struct queue *q)
++{
++    if(q->size==0)
++        return -1;
++    return q->arr[q->front];
++}
++void pop(struct queue *q)
++{
++    q->front = (q->front+1)%16;
++    q->size--;
++}
++struct queue q;
++
++// a mutex object lock
++// a semaphore object empty
++// a semaphore object full
++struct thread_mutex mtx;
++struct thread_mutex mtx2;
++struct sem_t empty, full;
++
++void init_semaphore()
++{
++	// initialize mutex lock
++	// initialize semaphore empty with 5
++	// initialize semaphore full with 0
++    thread_mutex_init(&mtx);
++	thread_mutex_init(&mtx2);
++    thread_sem_init(&empty, 5);
++    thread_sem_init(&full, 0);
++}
++
++void ProducerFunc(void * arg)
++{
++	 thread_mutex_lock(&mtx2);
++	printf("%s\n",(char*)arg);
++	thread_mutex_unlock(&mtx2);
++	sleep(10);
++	int i;
++	for(i=1;i<=10;i++)
++	{
++		// wait for semphore empty
++        thread_sem_wait(&empty);
++		// wait for mutex lock
++
++        thread_mutex_lock(&mtx);
++		sleep(1);
++		push(&q, i);
++		//thread_mutex_lock(&mtx);
++		printf("producer produced item %d\n",i);
++
++		// unlock mutex lock
++        thread_mutex_unlock(&mtx);
++		// post semaphore full
++        thread_sem_post(&full);
++	}
++
++    thread_exit();
++}
++
++void ConsumerFunc(void * arg)
++{
++	thread_mutex_lock(&mtx2);
++	printf("%s\n",(char*)arg);
++	thread_mutex_unlock(&mtx2);
++
++	int i;
++	for(i=1;i<=10;i++)
++	{
++		// wait for semphore full
++        thread_sem_wait(&full);
++		// wait for mutex lock
++
++        thread_mutex_lock(&mtx);
++		sleep(1);
++		int item = front(&q);
++		pop(&q);
++		// thread_mutex_lock(&mtx);
++		printf("consumer consumed item %d\n",item);
++
++
++		// unlock mutex lock
++		thread_mutex_unlock(&mtx);
++		// post semaphore empty
++        thread_sem_post(&empty);
++	}
++    thread_exit();
++}
++
++int main(void)
++{
++
++	init_semaphore();
++
++	char * message1 = "i am producer";
++	char * message2 = "i am consumer";
++
++
++	void *s1, *s2;
++	int thread1, thread2;
++
++	s1 = malloc(4096);
++	s2 = malloc(4096);
++
++
++	thread1 = thread_create(ProducerFunc, (void*)message1, s1);
++
++
++	thread2 = thread_create(ConsumerFunc, (void*)message2, s2);
++
++
++	thread_join(thread1);
++	thread_join(thread2);
++
++	exit(0);
++}
+diff --git a/user/threadLock.h b/user/threadLock.h
+new file mode 100644
+index 0000000..a702b97
+--- /dev/null
++++ b/user/threadLock.h
+@@ -0,0 +1,112 @@
++#ifndef __THREAD_LOCK__H
++#define __THREAD_LOCK__H
++
++#include "kernel/types.h"
++#include "kernel/riscv.h"
++#include "user/user.h"
++
++//===============Basically followed from spinlock.c============================
++
++struct thread_mutex
++{
++    uint locked;       //if lock is held then locked=1; else 0
++    int pid;
++};
++
++struct thread_spinlock
++{
++    uint locked;       //if lock is held then locked=1; else 0
++    int pid;
++};
++
++
++//used to check if the current thread is holding the respective spinlock
++// basically holding method of spinlock.c (just instead of  lk->cpu == mycpu()) ,we need to check lk->pid)
++int
++holdingSL(struct thread_spinlock *lk)
++{
++  int r;
++  r = (lk->locked && lk->pid == getpid());
++  return r;
++}
++
++int
++holdingMx(struct thread_mutex *lk)
++{
++  int r = 0;
++  r = (lk->locked && lk->pid == getpid());
++  return r;
++}
++
++void
++thread_spin_init(struct thread_spinlock *lk)
++{
++  lk->locked = 0;
++  lk->pid = -1;
++}
++
++
++void
++thread_mutex_init(struct thread_mutex *lk)
++{
++  lk->locked = 0;
++  lk->pid = -1;
++}
++
++// Acquire the lock.
++// Loops (spins) until the lock is acquired.
++// basically the acquire function of spinlock
++void
++thread_spin_lock(struct thread_spinlock *lk)
++{
++
++  if(holdingSL(lk))
++    printf("thread_spin_lock_acquire"); //paniccccccccccccccccccccccccccccccccc acquire
++  while(__sync_lock_test_and_set(&lk->locked, 1) != 0)
++    ;
++  __sync_synchronize();
++   // Record info about lock acquisition for holding() and debugging.
++  lk->pid = getpid();
++}
++
++void
++thread_mutex_lock(struct thread_mutex *lk)
++{
++    if(holdingMx(lk))
++        printf("thread_mutex_lock");
++    while(__sync_lock_test_and_set(&lk->locked, 1) != 0){
++        sleep(10);  // instesd of yeild
++    }
++    __sync_synchronize();
++  // Record info about lock acquisition for holding() and debugging.
++    lk->pid = getpid();
++}
++
++// Release the lock.
++//basically the release function of spinlock.c
++void
++thread_spin_unlock(struct thread_spinlock *lk)
++{
++  if(!holdingSL(lk))
++    {
++      printf("thread_spin_lock_release");
++    }
++  lk->pid = -1;  //  lk->cpu = 0;
++  __sync_synchronize();
++  __sync_lock_release(&lk->locked);
++}
++
++
++// Release the lock.
++void
++thread_mutex_unlock(struct thread_mutex *lk)
++{
++  if(!holdingMx(lk))
++    printf("thread_mutex_release");
++  lk->pid = -1;
++  __sync_synchronize();
++  __sync_lock_release(&lk->locked);
++}
++
++
++#endif
+\ No newline at end of file
+diff --git a/user/thread_cv.h b/user/thread_cv.h
+new file mode 100644
+index 0000000..549bfdc
+--- /dev/null
++++ b/user/thread_cv.h
+@@ -0,0 +1,74 @@
++#ifndef __THREAD_CV_H__
++#define __THREAD_CV_H__
++
++#include "kernel/types.h"
++#include "user/user.h"
++#include "user/threadLock.h"
++
++//===================Condition variables are used with a mutex and with a loop (to check a condition).
++struct thread_cond_var
++{
++    int signal; // 0 or 1 (waiting or signaled)
++    int inWaiting;     // number of waiting threads
++};
++
++void thread_cond_init(struct thread_cond_var *con_var)
++{
++    con_var->signal = 0;
++    con_var->inWaiting = 0;
++}
++/****
++ * pthread_cond_wait performs three actions:
++unlock the mutex
++waits (sleeps until pthread_cond_signal is called on the same condition variable). It does 1 and 2 atomically.
++Before returning, locks the mutex
++*/
++// (the mutex that must be held before calling this function).
++void thread_cond_wait(struct thread_cond_var *con_var, struct thread_mutex *mutx)
++{
++     // atomically fetches the value of con_var->signal, and updates it to 0.
++    __sync_fetch_and_and(&con_var->signal, 0);
++    //lock kore pathacchilam
++    thread_mutex_unlock(mutx);
++
++   // loop that continues while the signal is 0 (waiting condition). as we don't have any only compare function...!!!!!
++    while(__sync_bool_compare_and_swap(&con_var->signal, 0, 0))
++    {
++        //This atomic operation increments the value of con_var->n by 1. con_var->n represents the number of threads currently waiting.
++        __sync_fetch_and_add(&con_var->inWaiting, 1); //just optimization**********************************************
++        //invokes the conditional_wait function to put the current thread to sleep while waiting for the condition to be signaled.
++        conditional_wait(&con_var->signal, 0);
++        //This atomic operation decrements the value of lk->n by 1, indicating that one waiting thread has awakened.
++        __sync_fetch_and_add(&con_var->inWaiting, -1); ////just optimization**********************************************
++    }
++
++    thread_mutex_lock(mutx);
++}
++
++
++void thread_cond_signal(struct thread_cond_var *con_var)
++{
++    //ensures that all memory operations before this point are visible to other threads.
++    // It's used to ensure synchronization and visibility of data modifications across different threads
++    __sync_synchronize();
++     //This atomic operation compares the value of con_var->signal to 0. If it's 0, it replaces it with 1.
++    __sync_bool_compare_and_swap(&con_var->signal, 0, 1);
++
++    //checks if the value of  (number of waiting threads) is not equal to 0.
++    if (!__sync_bool_compare_and_swap(&con_var->inWaiting, 0, 0)) //********************optimization
++    {
++
++		conditional_wake(&con_var->signal, 1);
++	}
++}
++// sobai k jaganor jonno
++void thread_cond_broadcast(struct thread_cond_var *con_var){
++    __sync_synchronize();
++
++    __sync_bool_compare_and_swap(&con_var->signal, 0, 1);
++    if (!__sync_bool_compare_and_swap(&con_var->inWaiting, 0, 0)) {
++		conditional_wake(&con_var->signal, 64);
++	}
++}
++
++#endif
+\ No newline at end of file
+diff --git a/user/thread_semaphore.h b/user/thread_semaphore.h
+new file mode 100644
+index 0000000..fad74f3
+--- /dev/null
++++ b/user/thread_semaphore.h
+@@ -0,0 +1,42 @@
++#ifndef __SEM_H__
++#define __SEM_H__
++
++#include "kernel/types.h"
++#include "user/user.h"
++#include "user/thread_cv.h"
++#include "user/threadLock.h"
++//********************************************** followed the implementation given in the link  in the spec ********************************************
++struct sem_t
++{
++    int count;
++    struct thread_mutex m;
++    struct thread_cond_var cv;
++};
++
++void thread_sem_init(struct sem_t *s, int value)
++{
++    s->count = value;
++    thread_mutex_init(&s->m);
++    thread_cond_init(&s->cv);
++}
++
++void thread_sem_post(struct sem_t *s)
++{
++	thread_mutex_lock(&s->m);
++    s->count++;
++    thread_cond_signal(&s->cv);
++
++    thread_mutex_unlock(&s->m);
++}
++void thread_sem_wait(struct sem_t *s)
++{
++	thread_mutex_lock(&s->m);
++    while (s->count == 0)
++    {
++        thread_cond_wait(&s->cv, &s->m);
++    }
++    s->count--;
++    thread_mutex_unlock(&s->m);
++}
++
++#endif
+diff --git a/user/threads.c b/user/threads.c
+new file mode 100644
+index 0000000..f1d0bc2
+--- /dev/null
++++ b/user/threads.c
+@@ -0,0 +1,76 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "user/threadLock.h"
++
++struct balance {
++    char name[32];
++    int amount;
++};
++
++struct thread_spinlock lock;
++struct thread_mutex mlock;
++volatile int total_balance = 0;
++
++
++volatile unsigned int delay (unsigned int d) {
++   unsigned int i;
++   for (i = 0; i < d; i++) {
++       __asm volatile( "nop" ::: );
++   }
++
++   return i;
++}
++
++void do_work(void *arg){
++    int i;
++    int old;
++
++    struct balance *b = (struct balance*) arg;
++    //thread_mutex_lock(&mlock);
++    thread_spin_lock(&lock);
++    printf( "Starting do_work: s:%s\n", b->name);
++     //thread_mutex_unlock(&mlock);
++     thread_spin_unlock(&lock);
++
++    for (i = 0; i < b->amount; i++) {
++        // lock and mlock will be implemented by you.
++         thread_spin_lock(&lock);
++         //thread_mutex_lock(&mlock);
++         old = total_balance;
++         delay(10000);
++	 // if(old != total_balance)  printf("we will miss an update. old: %d total_balance: %d\n", old, total_balance);
++         total_balance = old + 1;
++        thread_spin_unlock(&lock);
++         //thread_mutex_unlock(&mlock);
++
++    }
++
++    printf( "Done s:%x\n", b->name);
++
++    thread_exit();
++    return;
++}
++
++int main(int argc, char *argv[]) {
++ thread_spin_init(&lock);
++  thread_mutex_init(&mlock);
++  struct balance b1 = {"b1", 3200};
++  struct balance b2 = {"b2", 2800};
++
++  void *s1, *s2;
++  int thread1, thread2, r1, r2;
++
++  s1 = malloc(4096); // 4096 is the PGSIZE defined in kernel/riscv.h
++  s2 = malloc(4096);
++
++  thread1 = thread_create(do_work, (void*)&b1, s1);
++  thread2 = thread_create(do_work, (void*)&b2, s2);
++
++  r1 = thread_join(thread1);
++  r2 = thread_join(thread2);
++  printf("Threads finished: (%d):%d, (%d):%d, shared balance:%d\n",
++      thread1, r1, thread2, r2, total_balance);
++
++  exit(0);
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index 4d398d5..20894f2 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -22,6 +22,11 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int thread_create(void(*fcn)(void*), void *arg, void*stack);
++int thread_join(int);
++int thread_exit(void);
++int conditional_wait(int *, int);
++void conditional_wake(int *, int);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..b1cbe41 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,8 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("thread_create");
++entry("thread_join");
++entry("thread_exit");
++entry("conditional_wait");
++entry("conditional_wake");
